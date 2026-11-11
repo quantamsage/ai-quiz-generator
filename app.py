@@ -3,8 +3,11 @@
 import streamlit as st
 
 from ai import QuizGenerationError, generate_quiz
+from notes import SUPPORTED_TYPES, NotesError, extract_notes
+from scoring import calculate_score, missed_questions, results_csv
 
 DIFFICULTIES = ["Easy", "Medium", "Hard"]
+SOURCES = ["A topic", "My notes (PDF or text file)"]
 
 
 def init_state() -> None:
@@ -15,6 +18,7 @@ def init_state() -> None:
         "submitted": False,
         "answers": [],       # answers saved at submit time
         "quiz_topic": "",
+        "attempt": 1,        # 1 for a fresh quiz, 2+ for retries of missed questions
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -28,15 +32,27 @@ def answer_key(index: int) -> str:
 def render_header() -> None:
     st.title("AI Quiz Generator")
     st.write(
-        "Enter any topic and get a multiple-choice quiz written by Google Gemini. "
-        "Answer the questions, submit, and see your score with explanations."
+        "Enter any topic, or upload your own notes, and get a multiple-choice quiz written by "
+        "Google Gemini. Answer the questions, see your score with explanations, then retry the "
+        "ones you missed."
     )
 
 
 def render_settings() -> None:
     """Quiz settings form. Generates a new quiz when submitted."""
+    source = st.radio("Build the quiz from", SOURCES, horizontal=True)
+    from_notes = source == SOURCES[1]
+
     with st.form("settings"):
-        topic = st.text_input("Topic", placeholder="e.g. Java OOP, Photosynthesis, World War II")
+        uploaded = None
+        if from_notes:
+            uploaded = st.file_uploader(
+                "Upload your notes", type=SUPPORTED_TYPES,
+                help="Text-based PDFs, .txt or .md files. Scanned PDFs can't be read.",
+            )
+            topic = st.text_input("Quiz title (optional)", placeholder="e.g. Biology chapter 4")
+        else:
+            topic = st.text_input("Topic", placeholder="e.g. Java OOP, Photosynthesis, World War II")
         col1, col2 = st.columns(2)
         with col1:
             num_questions = st.slider("Number of questions", min_value=3, max_value=10, value=5)
@@ -45,12 +61,27 @@ def render_settings() -> None:
         generate = st.form_submit_button("Generate Quiz", type="primary", width="stretch")
 
     if generate:
-        if not topic.strip():
+        notes = None
+        if from_notes:
+            if uploaded is None:
+                st.warning("Please upload a notes file first.")
+                return
+            try:
+                notes, truncated = extract_notes(uploaded.name, uploaded.getvalue())
+            except NotesError as e:
+                st.error(str(e))
+                return
+            if truncated:
+                st.info("Your notes are long, so only the first part was used for this quiz.")
+            if not topic.strip():
+                topic = uploaded.name.rsplit(".", 1)[0]
+        elif not topic.strip():
             st.warning("Please enter a topic first.")
             return
+
         with st.spinner(f"Writing {num_questions} {difficulty.lower()} questions about {topic.strip()}..."):
             try:
-                quiz = generate_quiz(topic, num_questions, difficulty)
+                quiz = generate_quiz(topic, num_questions, difficulty, notes=notes)
             except QuizGenerationError as e:
                 st.error(str(e))
                 return
@@ -60,6 +91,7 @@ def render_settings() -> None:
         st.session_state.submitted = False
         st.session_state.answers = []
         st.session_state.quiz_topic = topic.strip()
+        st.session_state.attempt = 1
 
         if len(quiz) < num_questions:
             st.info(
@@ -72,6 +104,8 @@ def render_quiz() -> None:
     """Show the questions with answer choices and a submit button."""
     quiz = st.session_state.quiz
     st.subheader(f"Quiz: {st.session_state.quiz_topic}")
+    if st.session_state.attempt > 1:
+        st.caption(f"Retry {st.session_state.attempt - 1}: only the questions you missed, options reshuffled.")
 
     with st.form(f"quiz_{st.session_state.quiz_id}"):
         for i, q in enumerate(quiz):
@@ -95,11 +129,6 @@ def render_quiz() -> None:
         st.session_state.answers = answers
         st.session_state.submitted = True
         st.rerun()
-
-
-def calculate_score(quiz: list[dict], answers: list[str | None]) -> int:
-    """Count how many answers match the correct answer."""
-    return sum(1 for q, a in zip(quiz, answers) if a == q["correct_answer"])
 
 
 def render_results() -> None:
@@ -128,11 +157,32 @@ def render_results() -> None:
                 st.write(f"**Correct answer:** {q['correct_answer']}")
             st.write(f"**Explanation:** {q['explanation']}")
 
-    if st.button("Start a new quiz"):
-        st.session_state.quiz = None
-        st.session_state.submitted = False
-        st.session_state.answers = []
-        st.rerun()
+    st.divider()
+    missed = missed_questions(quiz, answers)
+    col_retry, col_download, col_new = st.columns(3)
+    with col_retry:
+        if st.button(f"Retry {len(missed)} missed", disabled=not missed, width="stretch"):
+            st.session_state.quiz = missed
+            st.session_state.quiz_id += 1
+            st.session_state.attempt += 1
+            st.session_state.submitted = False
+            st.session_state.answers = []
+            st.rerun()
+    with col_download:
+        st.download_button(
+            "Download results",
+            results_csv(st.session_state.quiz_topic, quiz, answers),
+            file_name="quiz_results.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    with col_new:
+        if st.button("Start a new quiz", width="stretch"):
+            st.session_state.quiz = None
+            st.session_state.submitted = False
+            st.session_state.answers = []
+            st.session_state.attempt = 1
+            st.rerun()
 
 
 def main() -> None:
